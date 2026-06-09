@@ -2,6 +2,10 @@
 
 test.conf
 
+# Config files contain secrets (API tokens, Zone IDs)
+*.conf
+update-cloudflare-dns.conf
+
 # General
 .DS_Store
 .AppleDouble

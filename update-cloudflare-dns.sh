@@ -14,7 +14,6 @@ exec > >(tee $LOG_FILE) 2>&1
 echo "==> $(date "+%Y-%m-%d %H:%M:%S")"
 
 ### Validate if config-file exists
-
 if [[ -z "$1" ]]; then
   if ! source ${parent_path}/update-cloudflare-dns.conf; then
     echo 'Error! Missing configuration file update-cloudflare-dns.conf or invalid syntax!'
@@ -27,16 +26,16 @@ else
   fi
 fi
 
+### Check that at least one dns_record variable is set
+if [ -z "${dns_record}" ] && [ -z "${dns_record_proxy}" ]; then
+  echo 'Error! dns_record and dns_record_proxy are both empty. Nothing to update.'
+  exit 0
+fi
+
 ### Check validity of "ttl" parameter
 if [ "${ttl}" -lt 120 ] || [ "${ttl}" -gt 7200 ] && [ "${ttl}" -ne 1 ]; then
   echo "Error! ttl out of range (120-7200) or not set to 1"
   exit
-fi
-
-### Check validity of "proxied" parameter
-if [ "${proxied}" != "false" ] && [ "${proxied}" != "true" ]; then
-  echo 'Error! Incorrect "proxied" parameter, choose "true" or "false"'
-  exit 0
 fi
 
 ### Check validity of "what_ip" parameter
@@ -45,9 +44,9 @@ if [ "${what_ip}" != "external" ] && [ "${what_ip}" != "internal" ]; then
   exit 0
 fi
 
-### Check if set to internal ip and proxy
-if [ "${what_ip}" == "internal" ] && [ "${proxied}" == "true" ]; then
-  echo 'Error! Internal IP cannot be proxied'
+### Internal IP cannot be used with proxied records
+if [ "${what_ip}" == "internal" ] && [ -n "${dns_record_proxy}" ]; then
+  echo 'Error! Internal IP cannot be used with dns_record_proxy (Cloudflare proxy requires a public IP)'
   exit 0
 fi
 
@@ -88,14 +87,31 @@ if [ "${what_ip}" == "internal" ]; then
   echo "==> Internal ${interface} IP is: $ip"
 fi
 
-### Build coma separated array fron dns_record parameter to update multiple A records
-IFS=',' read -d '' -ra dns_records <<<"$dns_record,"
-unset 'dns_records[${#dns_records[@]}-1]'
-declare dns_records
+### Build unified list of "record|proxied" entries from both config variables
+all_records=()
 
-for record in "${dns_records[@]}"; do
+if [ -n "${dns_record}" ]; then
+  IFS=',' read -d '' -ra _recs <<<"${dns_record},"
+  unset '_recs[${#_recs[@]}-1]'
+  for r in "${_recs[@]}"; do
+    all_records+=("${r}|false")
+  done
+fi
+
+if [ -n "${dns_record_proxy}" ]; then
+  IFS=',' read -d '' -ra _recs_proxy <<<"${dns_record_proxy},"
+  unset '_recs_proxy[${#_recs_proxy[@]}-1]'
+  for r in "${_recs_proxy[@]}"; do
+    all_records+=("${r}|true")
+  done
+fi
+
+for entry in "${all_records[@]}"; do
+  record="${entry%%|*}"
+  record_proxied="${entry##*|}"
+
   ### Get IP address of DNS record from 1.1.1.1 DNS server when proxied is "false"
-  if [ "${proxied}" == "false" ]; then
+  if [ "${record_proxied}" == "false" ]; then
     ### Check if "nslookup" command is present
     if which nslookup >/dev/null; then
       dns_record_ip=$(nslookup ${record} 1.1.1.1 | awk '/Address/ { print $2 }' | sed -n '2p')
@@ -105,33 +121,33 @@ for record in "${dns_records[@]}"; do
     fi
 
     if [ -z "$dns_record_ip" ]; then
-      echo "Error! Can't resolve the ${record} via 1.1.1.1 DNS server"
-      exit 0
+      echo "Error! Can't resolve ${record} via 1.1.1.1 DNS server"
+      continue
     fi
-    is_proxed="${proxied}"
+    is_proxied="false"
   fi
 
   ### Get the dns record id and current proxy status from Cloudflare API when proxied is "true"
-  if [ "${proxied}" == "true" ]; then
+  if [ "${record_proxied}" == "true" ]; then
     dns_record_info=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records?type=A&name=$record" \
       -H "Authorization: Bearer $cloudflare_zone_api_token" \
       -H "Content-Type: application/json")
     if [[ ${dns_record_info} == *"\"success\":false"* ]]; then
       echo ${dns_record_info}
       echo "Error! Can't get dns record info from Cloudflare API"
-      exit 0
+      continue
     fi
-    is_proxed=$(echo ${dns_record_info} | grep -o '"proxied":[^,]*' | grep -o '[^:]*$')
+    is_proxied=$(echo ${dns_record_info} | grep -o '"proxied":[^,]*' | grep -o '[^:]*$')
     dns_record_ip=$(echo ${dns_record_info} | grep -o '"content":"[^"]*' | cut -d'"' -f 4)
   fi
 
   ### Check if ip or proxy have changed
-  if [ ${dns_record_ip} == ${ip} ] && [ ${is_proxed} == ${proxied} ]; then
-    echo "==> DNS record IP of ${record} is ${dns_record_ip}", no changes needed.
+  if [ "${dns_record_ip}" == "${ip}" ] && [ "${is_proxied}" == "${record_proxied}" ]; then
+    echo "==> DNS record IP of ${record} is ${dns_record_ip}, proxied: ${record_proxied} — no changes needed."
     continue
   fi
 
-  echo "==> DNS record of ${record} is: ${dns_record_ip}. Trying to update..."
+  echo "==> DNS record of ${record} is: ${dns_record_ip}, proxied: ${is_proxied}. Trying to update..."
 
   ### Get the dns record information from Cloudflare API
   cloudflare_record_info=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records?type=A&name=$record" \
@@ -140,7 +156,7 @@ for record in "${dns_records[@]}"; do
   if [[ ${cloudflare_record_info} == *"\"success\":false"* ]]; then
     echo ${cloudflare_record_info}
     echo "Error! Can't get ${record} record information from Cloudflare API"
-    exit 0
+    continue
   fi
 
   ### Get the dns record id from response
@@ -150,29 +166,29 @@ for record in "${dns_records[@]}"; do
   update_dns_record=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records/$cloudflare_dns_record_id" \
     -H "Authorization: Bearer $cloudflare_zone_api_token" \
     -H "Content-Type: application/json" \
-    --data "{\"type\":\"A\",\"name\":\"$record\",\"content\":\"$ip\",\"ttl\":$ttl,\"proxied\":$proxied}")
+    --data "{\"type\":\"A\",\"name\":\"$record\",\"content\":\"$ip\",\"ttl\":$ttl,\"proxied\":$record_proxied}")
   if [[ ${update_dns_record} == *"\"success\":false"* ]]; then
     echo ${update_dns_record}
-    echo "Error! Update failed"
-    exit 0
+    echo "Error! Update failed for ${record}"
+    continue
   fi
 
   echo "==> Success!"
-  echo "==> $record DNS Record updated to: $ip, ttl: $ttl, proxied: $proxied"
+  echo "==> ${record} DNS Record updated to: ${ip}, ttl: ${ttl}, proxied: ${record_proxied}"
 
   ### Telegram notification
   if [ ${notify_me_telegram} == "no" ]; then
-    exit 0
+    continue
   fi
 
   if [ ${notify_me_telegram} == "yes" ]; then
     telegram_notification=$(
-      curl -s -X GET "https://api.telegram.org/bot${telegram_bot_API_Token}/sendMessage?chat_id=${telegram_chat_id}" --data-urlencode "text=${record} DNS record updated to: ${ip}"
+      curl -s -X GET "https://api.telegram.org/bot${telegram_bot_API_Token}/sendMessage?chat_id=${telegram_chat_id}" --data-urlencode "text=${record} DNS record updated to: ${ip}, proxied: ${record_proxied}"
     )
     if [[ ${telegram_notification=} == *"\"ok\":false"* ]]; then
       echo ${telegram_notification=}
       echo "Error! Telegram notification failed"
-      exit 0
     fi
   fi
+
 done
